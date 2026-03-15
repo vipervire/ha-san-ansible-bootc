@@ -1,0 +1,8 @@
+---
+# OS-specific variables for RHEL/Rocky Linux — pacemaker role
+
+_pacemaker_packages:
+  - pacemaker
+  - corosync
+  - pcs
+  - fence-agents-all

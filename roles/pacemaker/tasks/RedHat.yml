@@ -1,0 +1,17 @@
+---
+# roles/pacemaker/tasks/RedHat.yml — Rocky Linux-specific Pacemaker installation
+
+- name: Install High Availability repo
+  ansible.builtin.dnf:
+    name: "{{ _pacemaker_packages }}"
+    state: present
+    enablerepo: highavailability
+
+- name: Install python-kasa via pip (not available in RHEL/Rocky repos)
+  ansible.builtin.pip:
+    name: python-kasa
+    state: present
+    executable: pip3
+  when: >
+    stonith_nodes is defined and
+    stonith_nodes.values() | selectattr('method', 'equalto', 'kasa') | list | length > 0

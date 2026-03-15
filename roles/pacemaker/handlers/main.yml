@@ -1,0 +1,11 @@
+---
+- name: restart corosync
+  # Use corosync-cfgtool -R (reload) instead of a full restart to avoid
+  # triggering membership recalculation and brief resource disruption.
+  ansible.builtin.command:
+    cmd: corosync-cfgtool -R
+  changed_when: true
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true

@@ -1,0 +1,234 @@
+---
+# roles/services/tasks/main.yml — NFS, SMB, and client-facing iSCSI configuration
+# These services are INSTALLED but NOT ENABLED — Pacemaker manages start/stop.
+
+- name: Load OS-family variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Load distribution-specific variable overrides
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}-{{ ansible_distribution_major_version }}.yml"
+        - "{{ ansible_distribution }}.yml"
+      paths:
+        - "{{ role_path }}/vars"
+      skip: true
+  when: ansible_distribution != ansible_os_family
+
+- name: Include OS-specific package installation tasks
+  ansible.builtin.include_tasks: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}.yml"
+        - "{{ ansible_os_family }}.yml"
+      paths:
+        - "{{ role_path }}/tasks"
+  when: not (bootc_skip_packages | default(false))
+
+# ─── NFS ────────────────────────────────────────────────────────────────────
+- name: Disable NFS auto-start (Pacemaker manages this)
+  ansible.builtin.systemd:
+    name: "{{ _nfs_server_service }}"
+    enabled: false
+
+# ─── Shared cluster configuration directory ───────────────────────────────
+- name: Create cluster config directory structure on shared pool
+  ansible.builtin.file:
+    path: "/{{ zfs_pool_name }}/cluster-config/{{ item }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  loop:
+    - ""
+    - "nfs"
+    - "samba"
+    - "samba/private"
+    - "iscsi"
+  when: >
+    ansible_mounts | selectattr('mount', 'equalto', '/' + zfs_pool_name) | list | length > 0
+  ignore_errors: true
+  run_once: true
+  delegate_to: "{{ pacemaker_preferred_node }}"
+
+- name: Initialize exports on shared storage (if not exists)
+  ansible.builtin.template:
+    src: exports.j2
+    dest: "/{{ zfs_pool_name }}/cluster-config/nfs/exports"
+    mode: "0644"
+    force: false
+  when: >
+    ansible_mounts | selectattr('mount', 'equalto', '/' + zfs_pool_name) | list | length > 0
+  ignore_errors: true
+  run_once: true
+  delegate_to: "{{ pacemaker_preferred_node }}"
+
+- name: Initialize smb.conf on shared storage (if not exists)
+  ansible.builtin.template:
+    src: smb.conf.j2
+    dest: "/{{ zfs_pool_name }}/cluster-config/samba/smb.conf"
+    mode: "0644"
+    force: false
+  when: >
+    ansible_mounts | selectattr('mount', 'equalto', '/' + zfs_pool_name) | list | length > 0
+  ignore_errors: true
+  run_once: true
+  delegate_to: "{{ pacemaker_preferred_node }}"
+
+# ─── Symlink local config paths to shared storage ─────────────────────────
+- name: Symlink /etc/exports to shared storage
+  ansible.builtin.file:
+    src: "/{{ zfs_pool_name }}/cluster-config/nfs/exports"
+    dest: /etc/exports
+    state: link
+    force: true
+
+- name: Deploy /etc/nfs.conf
+  ansible.builtin.template:
+    src: nfs.conf.j2
+    dest: /etc/nfs.conf
+    mode: "0644"
+
+# ─── Samba / SMB ────────────────────────────────────────────────────────────
+- name: Disable Samba auto-start (Pacemaker manages this)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+  loop: "{{ _samba_services }}"
+
+- name: Symlink /etc/samba/smb.conf to shared storage
+  ansible.builtin.file:
+    src: "/{{ zfs_pool_name }}/cluster-config/samba/smb.conf"
+    dest: /etc/samba/smb.conf
+    state: link
+    force: true
+
+- name: Symlink /var/lib/samba/private to shared storage
+  ansible.builtin.file:
+    src: "/{{ zfs_pool_name }}/cluster-config/samba/private"
+    dest: /var/lib/samba/private
+    state: link
+    force: true
+
+# ─── Client-facing iSCSI target (Pacemaker-managed, per-VLAN TPGs) ──────────
+# Triggered when any client VLAN has 'iscsi' in its services list.
+# Each iSCSI-enabled VLAN gets its own TPG with isolated portals, ACLs, and LUNs.
+# Single-VLAN deployments produce one TPG, functionally identical to the old behavior.
+
+- name: Deploy encrypted iSCSI CHAP credentials
+  ansible.builtin.shell:
+    cmd: |
+      cat <<'CHAP_EOF' | openssl enc -aes-256-cbc -pbkdf2 -salt \
+        -pass file:/etc/machine-id -out /root/.iscsi-chap.env.enc
+      {{ lookup('template', 'iscsi-chap-credentials.env.j2') }}
+      CHAP_EOF
+      chmod 0600 /root/.iscsi-chap.env.enc
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+  # always-changed: openssl -salt produces a different ciphertext on every run so a
+  # checksum comparison cannot detect whether the plaintext credentials changed.
+  changed_when: true
+  no_log: true
+
+- name: Deploy iSCSI VLAN config (deploy-time TPG/VLAN mapping, paths — no secrets)
+  ansible.builtin.template:
+    src: iscsi-vlan-config.json.j2
+    dest: /root/iscsi-vlan-config.json
+    mode: "0600"
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+
+- name: Deploy iSCSI config manager
+  ansible.builtin.template:
+    src: iscsi-config-manager.py.j2
+    dest: /root/iscsi-config-manager.py
+    mode: "0700"
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+
+- name: Run client LIO target setup (always — idempotent, picks up VLAN/TPG changes)
+  ansible.builtin.command:
+    cmd: /root/iscsi-config-manager.py setup
+  changed_when: true
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+
+# ─── iSCSI LUN auto-sync (maps zvols to LUNs on pool import) ────────────
+# Ensures zvols created by any method (Houston Cockpit, ZFS-over-iSCSI
+# plugin, manual zfs create) are mapped as LUNs on both nodes after
+# failover. Pacemaker runs this between zfs-pool import and vip-iscsi.
+- name: Deploy iSCSI LUN sync systemd service
+  ansible.builtin.template:
+    src: sync-iscsi-luns.service.j2
+    dest: /etc/systemd/system/sync-iscsi-luns.service
+    mode: "0644"
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+  notify: reload systemd
+
+- name: Disable sync-iscsi-luns auto-start (Pacemaker manages this)
+  ansible.builtin.systemd:
+    name: sync-iscsi-luns
+    enabled: false
+    daemon_reload: true
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+
+- name: Deploy iSCSI config sync path unit
+  ansible.builtin.template:
+    src: iscsi-config-sync.path.j2
+    dest: /etc/systemd/system/iscsi-config-sync.path
+    mode: "0644"
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+  notify: reload systemd
+
+- name: Deploy iSCSI config sync service unit
+  ansible.builtin.template:
+    src: iscsi-config-sync.service.j2
+    dest: /etc/systemd/system/iscsi-config-sync.service
+    mode: "0644"
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+  notify: reload systemd
+
+# Capture the current client config to shared ZFS storage before stripping.
+# Must run BEFORE stripping and BEFORE the path watcher (re-)enables.
+# Delegates to pacemaker_preferred_node because the ZFS pool is expected to be
+# mounted there. If the pool has failed over to the other node at re-deploy time,
+# this task will fail visibly — do not suppress with ignore_errors, so the
+# operator knows to re-run after confirming which node is currently active.
+- name: Save current client config to shared ZFS storage (before strip)
+  ansible.builtin.command:
+    cmd: /root/iscsi-config-manager.py save
+  when: >
+    (client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0) and
+    (hostvars[pacemaker_preferred_node]['ansible_mounts']
+      | selectattr('mount', 'equalto', '/' + zfs_pool_name) | list | length > 0)
+  changed_when: true
+  run_once: true
+  delegate_to: "{{ pacemaker_preferred_node }}"
+
+# Stop the path watcher before stripping so it cannot fire while saveconfig.json
+# is in the transient backend-only state and overwrite the shared client config.
+# ignore_errors: first deploy has the unit deployed but not yet known to systemd.
+- name: Stop iSCSI config sync path watcher before strip
+  ansible.builtin.systemd:
+    name: iscsi-config-sync.path
+    state: stopped
+  register: _stop_path_watcher
+  failed_when: >
+    _stop_path_watcher is failed and
+    'could not be found' not in (_stop_path_watcher.msg | default(''))
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+
+# Strip client entries from local saveconfig.json so they don't load at boot.
+# The sync script will restore the exact config from shared ZFS after pool import.
+- name: Strip client-facing entries from local saveconfig.json
+  ansible.builtin.command:
+    cmd: /root/iscsi-config-manager.py strip
+  changed_when: true
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0
+
+# Re-enable path watcher AFTER stripping — safe now that saveconfig.json is
+# backend-only and the shared client config was saved above.
+- name: Enable iSCSI config sync path watcher
+  ansible.builtin.systemd:
+    name: iscsi-config-sync.path
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0

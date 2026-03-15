@@ -1,0 +1,49 @@
+# Managed by Ansible — Samba configuration for HA SAN
+
+[global]
+    workgroup = {{ smb_workgroup }}
+    server string = {{ smb_server_string }}
+
+    # Bind to client VLAN VIPs where SMB is enabled
+    interfaces = {{ client_vlans | selectattr('services', 'contains', 'smb') | map(attribute='vip') | join(' ') }}
+    bind interfaces only = yes
+
+    # Security — SMB3 minimum, signing + encryption required
+    server min protocol = {{ smb_min_protocol }}
+    client min protocol = {{ smb_min_protocol }}
+    server signing = {{ smb_signing }}
+    client signing = {{ smb_signing }}
+    server smb encrypt = {{ smb_encrypt }}
+
+    # Authentication
+    map to guest = never
+    restrict anonymous = 2
+
+    # Account lockout via PAM faillock (5 failed attempts → 30 min lockout)
+    obey pam restrictions = yes
+    pam password change = yes
+
+    # Logging
+    log level = 1 auth_audit:3
+    logging = syslog
+
+    # Disable unnecessary features
+    load printers = no
+    disable spoolss = yes
+
+{% for share in smb_shares %}
+[{{ share.name }}]
+    path = {{ share.path }}
+    read only = {{ 'yes' if share.read_only else 'no' }}
+{% if share.valid_users is defined %}
+    valid users = {{ share.valid_users }}
+{% endif %}
+{% if share.shadow_copy | default(false) %}
+    vfs objects = shadow_copy2
+    shadow:snapdir = .zfs/snapshot
+    shadow:sort = desc
+    shadow:snapprefix = ^autosnap_
+    shadow:format = %%Y-%%m-%%d_%%H:%%M:%%S_
+{% endif %}
+
+{% endfor %}

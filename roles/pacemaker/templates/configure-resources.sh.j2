@@ -1,0 +1,196 @@
+#!/bin/bash
+# Managed by Ansible — Pacemaker resource configuration
+# Run AFTER:
+#   1. Cluster is formed (pcs cluster status shows all nodes online)
+#   2. STONITH is configured (bash /root/configure-stonith.sh)
+#   3. ZFS pool exists (bash /root/create-pool.sh)
+#   4. Pool is exported (zpool export {{ zfs_pool_name }})
+#
+# Usage: bash /root/configure-pacemaker-resources.sh
+set -euo pipefail
+
+echo "=== Configuring Pacemaker HA resources ==="
+
+# ─── ZFS pool import resource (anchor — everything colocates with this) ────
+#
+# STONITH FENCING LATENCY vs. ZFS POOL START TIMEOUT:
+#   On unplanned node failure, Pacemaker fences the dead node BEFORE importing
+#   the ZFS pool on the survivor (zfs multihost=on enforces this ordering).
+#   The start timeout (150s) must exceed the maximum expected fencing latency:
+#     ipmi  — ~20-30s  (BMC IPMI power cycle)
+#     kasa  — ~5-15s   (TP-Link Kasa smart plug)
+#     http  — varies
+#   150s provides ample headroom for all supported methods. If your fence
+#   agent is unusually slow, increase pcmk_reboot_timeout in configure-stonith.sh
+#   AND the start timeout here to match.
+echo "Creating/updating ZFS pool resource"
+pcs resource create zfs-pool ocf:heartbeat:ZFS \
+  pool="{{ zfs_pool_name }}" \
+  op start timeout=150s \
+  op stop timeout=90s \
+  op monitor interval=30s timeout=30s \
+  2>/dev/null || \
+  pcs resource update zfs-pool pool="{{ zfs_pool_name }}"
+
+# ─── Virtual IPs — one per client VLAN ───────────────────────────────────────
+# nic= ensures the VIP binds to the correct VLAN interface. Without it,
+# IPaddr2 auto-detection may pick the wrong interface on multi-VLAN hosts.
+# Interface naming depends on whether systemd-networkd manages interfaces:
+#   networking_manage: true  → "enduser-vlan"  (systemd-networkd netdev name)
+#   networking_manage: false → "ens3f1.30"     (traditional admin-managed name)
+echo "Creating/updating client VLAN VIP resources"
+{% for cv in client_vlans %}
+{% if networking_manage | default(false) %}
+{% set _nic = cv.name ~ '-vlan' %}
+{% else %}
+{% set _nic = (cv.parent_interface | default(net_client_parent)) ~ '.' ~ cv.id | string %}
+{% endif %}
+pcs resource create vip-{{ cv.name }} ocf:heartbeat:IPaddr2 \
+  ip="{{ cv.vip }}" cidr_netmask={{ cv.vip_cidr }} \
+  nic="{{ _nic }}" \
+  op monitor interval=10s \
+  2>/dev/null || \
+  pcs resource update vip-{{ cv.name }} ip="{{ cv.vip }}" cidr_netmask={{ cv.vip_cidr }} nic="{{ _nic }}"
+
+{% endfor %}
+# Management VLAN VIP for Cockpit
+pcs resource create vip-cockpit ocf:heartbeat:IPaddr2 \
+  ip="{{ vip_cockpit }}" cidr_netmask={{ vip_mgmt_cidr }} \
+  nic="{{ net_mgmt_interface }}" \
+  op monitor interval=10s \
+  2>/dev/null || \
+  pcs resource update vip-cockpit ip="{{ vip_cockpit }}" cidr_netmask={{ vip_mgmt_cidr }} nic="{{ net_mgmt_interface }}"
+
+# ─── Service resources (only for services enabled in client_vlans) ────────
+{% set _has_nfs = client_vlans | selectattr('services', 'contains', 'nfs') | list | length > 0 %}
+{% set _has_smb = client_vlans | selectattr('services', 'contains', 'smb') | list | length > 0 %}
+{% set _has_iscsi = client_vlans | selectattr('services', 'contains', 'iscsi') | list | length > 0 %}
+{% set _portblock_port_map = {'iscsi': 3260, 'nfs': 2049, 'smb': 445} %}
+echo "Creating service resources (idempotent — skipped if already present)"
+{% if _has_nfs %}
+pcs resource create nfs-server systemd:nfs-kernel-server \
+  op start timeout=30s op stop timeout=30s \
+  op monitor interval=30s \
+  2>/dev/null || echo "  (nfs-server already exists)"
+{% endif %}
+
+{% if _has_smb %}
+pcs resource create smb-server systemd:smbd \
+  op start timeout=30s op stop timeout=30s \
+  op monitor interval=30s \
+  2>/dev/null || echo "  (smb-server already exists)"
+{% endif %}
+
+# Cockpit service (starts after pool import so it can access shared configs)
+pcs resource create cockpit-service systemd:cockpit.socket \
+  op start timeout=30s op stop timeout=30s \
+  op monitor interval=30s \
+  2>/dev/null || echo "  (cockpit-service already exists)"
+
+{% if _has_iscsi %}
+# ─── iSCSI LUN sync (auto-maps zvols to LIO LUNs after pool import) ──────
+# Runs after pool import so /dev/zvol/ entries exist, before iSCSI VIP so
+# Proxmox/k3s initiators see all LUNs when they reconnect after failover.
+# Handles zvols created by any method: Houston Cockpit, ZFS-over-iSCSI
+# plugin, manual 'zfs create -V', or Ansible.
+echo "Creating iSCSI LUN sync resource"
+pcs resource create sync-iscsi-luns systemd:sync-iscsi-luns \
+  op start timeout=60s op stop timeout=30s \
+  op monitor interval=0 \
+  2>/dev/null || echo "  (sync-iscsi-luns already exists)"
+{% endif %}
+
+# ─── Portblock/portunblock resources ─────────────────────────────────────────
+# Portblocks DROP packets on VIP:port while services are starting, so clients
+# see a timeout instead of RST (connection refused). Portunblock lifts the DROP
+# rules and sends TCP tickles to speed up client reconnection after failover.
+# On Debian 12 / RHEL 9, iptables is iptables-nft — rules go into the kernel
+# nftables backend and coexist cleanly with our inet-filter nftables.conf rules.
+#
+# Stop order (reversed): portunblock stops first (re-blocks via
+# reset_local_on_unblock_stop=true), then services drain, then VIPs are removed,
+# then portblock rules are cleaned up.
+echo "Creating portblock/portunblock resources"
+{% for cv in client_vlans %}
+{% for svc in cv.services | select('in', _portblock_port_map) %}
+pcs resource create portblock-{{ cv.name }}-{{ svc }} ocf:heartbeat:portblock \
+  ip="{{ cv.vip }}" portno={{ _portblock_port_map[svc] }} protocol=tcp action=block \
+  op start timeout=20s op stop timeout=20s op monitor interval=0 \
+  2>/dev/null || echo "  (portblock-{{ cv.name }}-{{ svc }} already exists)"
+pcs resource create portunblock-{{ cv.name }}-{{ svc }} ocf:heartbeat:portblock \
+  ip="{{ cv.vip }}" portno={{ _portblock_port_map[svc] }} protocol=tcp action=unblock \
+  tickle_dir=/run/portblock reset_local_on_unblock_stop=true \
+  op start timeout=20s op stop timeout=20s op monitor interval=0 \
+  2>/dev/null || echo "  (portunblock-{{ cv.name }}-{{ svc }} already exists)"
+{% endfor %}
+{% endfor %}
+
+# ─── san-services group (portblocks → VIPs → sync → services → portunblocks) ──
+# Portblocks start first to protect the VIP:port gap, portunblocks start last
+# to lift DROP rules and send TCP tickles once all services are ready.
+# Only services present in at least one client_vlans[].services are included.
+echo "Creating san-services group"
+pcs resource group add san-services \
+{% for cv in client_vlans %}
+{% for svc in cv.services | select('in', _portblock_port_map) %}
+  portblock-{{ cv.name }}-{{ svc }} \
+{% endfor %}
+{% endfor %}
+{% for cv in client_vlans %}
+  vip-{{ cv.name }} \
+{% endfor %}
+{% if _has_iscsi %}
+  sync-iscsi-luns \
+{% endif %}
+{% if _has_nfs %}
+  nfs-server \
+{% endif %}
+{% if _has_smb %}
+  smb-server \
+{% endif %}
+{% for cv in client_vlans %}
+{% for svc in cv.services | select('in', _portblock_port_map) %}
+  portunblock-{{ cv.name }}-{{ svc }} \
+{% endfor %}
+{% endfor %}
+  2>/dev/null || echo "  (san-services group already exists)"
+
+# Cockpit group stays separate (management VLAN)
+pcs resource group add cockpit-group vip-cockpit cockpit-service \
+  2>/dev/null || echo "  (cockpit-group already exists)"
+
+# ─── Ordering: pool must be fully started before any service group ─────────
+echo "Creating ordering constraints"
+pcs constraint order zfs-pool then san-services \
+  2>/dev/null || echo "  (order zfs-pool->san-services already exists)"
+pcs constraint order zfs-pool then cockpit-group \
+  2>/dev/null || echo "  (order zfs-pool->cockpit-group already exists)"
+
+# ─── Colocation: all resources must run on the same node as zfs-pool ───────
+echo "Creating colocation constraints"
+pcs constraint colocation add san-services with zfs-pool INFINITY \
+  2>/dev/null || echo "  (colocation san-services already exists)"
+pcs constraint colocation add cockpit-group with zfs-pool INFINITY \
+  2>/dev/null || echo "  (colocation cockpit-group already exists)"
+
+# ─── Location: prevent resources from running on quorum node ───────────────
+# Applied to zfs-pool; colocation propagates restriction to all other resources.
+pcs constraint location zfs-pool rule score=-INFINITY \#uname eq quorum \
+  2>/dev/null || true
+
+# ─── Prefer primary node (soft constraint — failover is still automatic) ───
+pcs constraint location zfs-pool prefers {{ pacemaker_preferred_node }}=100 \
+  2>/dev/null || echo "  (location preference may already exist)"
+
+echo ""
+echo "=== Pacemaker resource configuration complete ==="
+echo ""
+pcs status
+echo ""
+echo "Operational commands:"
+echo "  Status:           pcs status"
+echo "  Constraints:      pcs constraint show"
+echo "  Planned failover: pcs resource move zfs-pool storage-b"
+echo "  Clear constraint: pcs resource clear zfs-pool"
+echo "  Maintenance mode: pcs node standby storage-a"
+echo "  End maintenance:  pcs node unstandby storage-a"

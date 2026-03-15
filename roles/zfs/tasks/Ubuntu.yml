@@ -1,0 +1,48 @@
+---
+# roles/zfs/tasks/Ubuntu.yml — Ubuntu-specific ZFS installation
+# Ubuntu ships ZFS in the 'universe' repository natively; no contrib repo or DKMS build needed.
+
+- name: Enable universe repository
+  ansible.builtin.apt_repository:
+    repo: "deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }} universe"
+    state: present
+    filename: ubuntu-universe
+
+- name: Install ZFS prerequisites
+  ansible.builtin.apt:
+    name: "{{ _zfs_prereq_packages }}"
+    state: present
+    update_cache: true
+
+- name: Install ZFS packages
+  ansible.builtin.apt:
+    name: "{{ _zfs_packages }}"
+    state: present
+
+- name: Install sanoid dependencies
+  ansible.builtin.apt:
+    name: "{{ _sanoid_packages }}"
+    state: present
+  when: sanoid_install | default(false)
+
+- name: Install sanoid from apt (Ubuntu 24.04+)
+  ansible.builtin.apt:
+    name: sanoid
+    state: present
+  when:
+    - sanoid_install | default(false)
+    - ansible_distribution_major_version | int >= 24
+  ignore_errors: true  # In case package name differs in a point release
+
+- name: Inform about manual sanoid install on Ubuntu 22.04
+  ansible.builtin.debug:
+    msg: >
+      Ubuntu 22.04 does not ship sanoid in its repositories.
+      Dependencies have been installed. To install sanoid manually:
+        git clone https://github.com/jimsalterjrs/sanoid.git /opt/sanoid
+        ln -s /opt/sanoid/sanoid /usr/sbin/sanoid
+        ln -s /opt/sanoid/syncoid /usr/sbin/syncoid
+      Then create /etc/sanoid/ and re-run the playbook to deploy the configuration.
+  when:
+    - sanoid_install | default(false)
+    - ansible_distribution_major_version | int < 24
