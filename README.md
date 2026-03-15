@@ -1,371 +1,516 @@
-# HA ZFS-over-iSCSI SAN — Ansible Deployment
+# HA ZFS-over-iSCSI SAN — bootc Atomic Deployment + Ansible Cluster Bootstrap
 
-Two-node active/passive storage cluster with quorum, deploying:
-- ZFS mirroring over iSCSI for cross-node redundancy
-- Pacemaker/Corosync with aggressive-safe failover (~10-12s unplanned, ~5-8s planned)
-- Floating VIPs for NFS, SMB, and iSCSI client services
-- STONITH fencing (IPMI, Kasa, Tasmota, ESPHome, HTTP)
-- Security hardening (nftables, SSH, sysctl)
-- 45Drives Houston Cockpit plugins for web management
-- Sanoid automated snapshots
-- Prometheus monitoring (node, ZFS, cluster, STONITH exporters)
+This repository builds and deploys a three-node HA storage cluster:
 
-## Architecture
+- `storage-a` and `storage-b`: active/passive ZFS-over-iSCSI storage nodes
+- `quorum`: third vote for Pacemaker/Corosync quorum
+- floating VIPs for Cockpit, NFS, SMB, and client-facing iSCSI
+- STONITH fencing, hardening, monitoring, and operational helper scripts
 
+The recommended deployment path is now **bootc on CentOS Stream 9**:
+
+- the host OS is delivered as a **bootable OCI image**
+- installer ISO, qcow2, and raw artifacts are generated from that image
+- node configuration and cluster bootstrap stay in **Ansible**
+- rolling host updates use **`bootc upgrade` / `bootc rollback`** instead of in-place package-manager upgrades
+
+The original mutable Ansible deployment path is still present for labs, migrations, or environments that do not want bootc yet.
+
+## What this repo does
+
+The cluster design stays the same as the original playbook:
+
+- local disks on each storage node are exported to the peer over iSCSI
+- ZFS mirrors each node’s local disks with the peer’s exported disks
+- Pacemaker imports the pool on whichever storage node is active
+- client-facing NFS, SMB, iSCSI, and VIPs follow the active node during failover
+
+What changed is **how the operating system is delivered**:
+
+- **bootc image build time** now handles the base OS, kernel, repositories, ZFS, iSCSI, Pacemaker, Cockpit, and monitoring packages
+- **Ansible runtime** now focuses on host configuration, cluster setup, templates, firewalling, monitoring, and generated helper scripts
+- **manual operator-reviewed steps** are still retained for pool creation, STONITH validation, and Pacemaker resource creation
+
+## Recommended deployment modes
+
+### Recommended: bootc-based atomic deployment
+
+Use this when you want:
+
+- repeatable installs from an ISO or VM image
+- transactional OS updates with staged reboot-based activation
+- rollback with `bootc rollback`
+- a tighter “golden image + config” workflow
+
+This path is centered on:
+
+- `bootc/Containerfile.storage`
+- `bootc/Containerfile.quorum`
+- `bootc/build-images.sh`
+- `bootc/build-artifacts.sh`
+- `bootc/bootstrap-cluster.sh`
+
+### Also available: legacy mutable Ansible deployment
+
+You can still install a supported distro manually on all three nodes and run:
+
+```bash
+ansible-playbook -i inventory.yml site.yml
 ```
-┌─────────────────┐     iSCSI/40GbE       ┌─────────────────┐
-│   storage-a     │◄─────────────────────►│   storage-b     │
-│   (ACTIVE)      │    VLAN 10 / MTU 9000 │   (STANDBY)     │
-│                 │                       │                 │
-│  12× 1TB SSDs   │                       │  12× 1TB SSDs   │
-│  LIO target     │                       │  LIO target     │
-│  open-iscsi     │                       │  open-iscsi     │
-│  ZFS pool       │                       │  (ready)        │
-│  NFS/SMB/iSCSI  │                       │                 │
-│  Pacemaker      │◄──── Corosync ───────►│  Pacemaker      │
-└────────┬────────┘                       └────────┬────────┘
-         │              ┌──────────┐               │
-         └──────────────┤  quorum  ├───────────────┘
-                        │  (voter) │
-                        └──────────┘
+
+That path remains useful for development, comparison testing, or environments already standardized on Debian, Ubuntu, Rocky, or Alma. For new deployments, the bootc path is the intended default.
+
+## Supported platforms
+
+### bootc images
+
+- **CentOS Stream 9** bootc base image
+- storage image for `storage-a` and `storage-b`
+- quorum image for `quorum`
+
+### mutable playbook path
+
+`site.yml` still validates and supports:
+
+- Debian 12
+- Ubuntu 22.04 / 24.04
+- Rocky Linux 9
+- AlmaLinux 9
+- CentOS Stream 9
+
+## Repository layout
+
+```text
+.
+├── README.md
+├── inventory.yml
+├── site.yml
+├── verify.yml
+├── os-upgrade.yml
+├── group_vars/
+├── host_vars/
+├── roles/
+├── docs/
+└── bootc/
+    ├── README.md
+    ├── Containerfile.storage
+    ├── Containerfile.quorum
+    ├── build-images.sh
+    ├── build-artifacts.sh
+    ├── bootstrap-cluster.sh
+    ├── configs/
+    │   ├── qcow2-user.example.toml
+    │   ├── storage-a-installer.example.toml
+    │   ├── storage-b-installer.example.toml
+    │   └── quorum-installer.example.toml
+    └── files/
+        ├── 00-ha-san.toml
+        ├── config.toml
+        ├── prepare-root.conf
+        ├── build-zfs.sh
+        └── install-45drives.sh
 ```
+
+## How the bootc split works
+
+### Storage image (`bootc/Containerfile.storage`)
+
+Builds the image used for `storage-a` and `storage-b` and bakes in:
+
+- CentOS Stream 9 bootc base
+- OpenZFS on EL9 with DKMS
+- iSCSI initiator and target packages
+- Pacemaker, Corosync, pcs, and fence agents
+- NFS, Samba, Cockpit, exporters, and supporting tools
+- optional 45Drives Cockpit plugins (best effort)
+
+### Quorum image (`bootc/Containerfile.quorum`)
+
+Builds a smaller image for `quorum` and includes:
+
+- base admin and hardening packages
+- Pacemaker, Corosync, pcs, and fence agents
+- monitoring packages
+- no ZFS, no iSCSI target/initiator, and no storage-service stack
+
+### Image defaults baked into `bootc/files/`
+
+- `00-ha-san.toml` sets the installed root filesystem type to `xfs`
+- `config.toml` provides default minimum sizes for `/` and `/boot`
+- `prepare-root.conf` enables `composefs`
+- the default automatic update timer is masked so host upgrades happen only during planned maintenance
 
 ## Prerequisites
 
-1. **Three hosts** running Debian 12, Ubuntu 22.04/24.04, Rocky Linux 9, AlmaLinux 9, or CentOS Stream 9 minimal (fresh install)
-2. **SSH key access** as `storageadmin` with passwordless sudo
-3. **Network connectivity** on management VLAN between all nodes
-4. **Ansible 2.14+** on your control machine
+### 1) Build host for images and artifacts
+
+You need a machine that can run Podman and build the bootc images.
+
+Required:
+
+- Podman
+- enough local disk space for two images plus generated artifacts
+- if SELinux is enforcing on the build host, install the OSBuild SELinux policy package required by `bootc-image-builder`
+
+Optional but recommended:
+
+- access to a container registry for production updates
+- qemu/libvirt if you want to test qcow2 images before touching hardware
+
+### 2) Ansible control host
+
+You need a control machine that can reach all three nodes on the management network.
 
 ```bash
-# On your control machine
+python3 -m venv .venv
+source .venv/bin/activate
 pip install ansible
 ansible-galaxy collection install community.general
 ```
 
-## Atomic bootc variant
+### 3) Target nodes
 
-A bootc-based CentOS Stream 9 workflow now lives in `bootc/`. This keeps the host OS and package set in an OCI image that can be installed as a VM disk image or installer ISO, then updated transactionally.
+You need:
 
-Typical flow:
+- 3 nodes total: `storage-a`, `storage-b`, `quorum`
+- static management addressing for all three nodes
+- a **dedicated OS boot disk** on each node
+- storage data disks on the storage nodes that are **not** reused as the boot disk
+- SSH access for `storageadmin`
+- working fencing hardware or smart plugs before production cutover
+
+## Files you must edit before first deployment
+
+At minimum, review and customize:
+
+- `inventory.yml`
+- `group_vars/all.yml`
+- `group_vars/storage_nodes/cluster.yml`
+- `group_vars/storage_nodes/iscsi.yml`
+- `group_vars/storage_nodes/network.yml` if you want the playbook to manage interfaces
+- `group_vars/storage_nodes/services.yml`
+- `group_vars/storage_nodes/zfs.yml`
+- `host_vars/storage-a.yml`
+- `host_vars/storage-b.yml`
+- `host_vars/quorum.yml`
+
+For bootc installer media, also customize one of:
+
+- `bootc/configs/storage-a-installer.example.toml`
+- `bootc/configs/storage-b-installer.example.toml`
+- `bootc/configs/quorum-installer.example.toml`
+
+Or, for qcow2/raw VM-style images:
+
+- `bootc/configs/qcow2-user.example.toml`
+
+Before you deploy:
+
+- replace every `CHANGEME` or placeholder value
+- move all passwords and CHAP secrets into `ansible-vault`
+- replace the SSH key placeholders
+- replace all disk placeholders in `host_vars/storage-a.yml` and `host_vars/storage-b.yml` with persistent `/dev/disk/by-id/...` paths
+- confirm the installer disk in each bootc config is the dedicated OS disk, not a SAN data disk
+
+Generate a password hash for installer TOMLs with:
 
 ```bash
-# Build the storage + quorum bootc images
+openssl passwd -6
+```
+
+## Build and publish the bootc images
+
+### Lab or local proof-of-concept
+
+This is fine for building artifacts and testing locally:
+
+```bash
 ./bootc/build-images.sh
+```
 
-# Turn a bootc image into deployment artifacts
-./bootc/build-artifacts.sh -i localhost/ha-san-storage:latest -t qcow2
-./bootc/build-artifacts.sh -i localhost/ha-san-storage:latest -t bootc-installer -c bootc/configs/storage-a-installer.example.toml
+That creates:
 
-# After installing all three nodes, run the existing cluster bootstrap without package installs
+- `localhost/ha-san-storage:latest`
+- `localhost/ha-san-quorum:latest`
+
+### Production or long-lived deployments
+
+For real bootc lifecycle management, build the images with a registry reference the installed hosts can reach later for `bootc upgrade`.
+
+Example:
+
+```bash
+export STORAGE_IMAGE=registry.example.com/ha-san/storage:stable
+export QUORUM_IMAGE=registry.example.com/ha-san/quorum:stable
+./bootc/build-images.sh
+podman push "$STORAGE_IMAGE"
+podman push "$QUORUM_IMAGE"
+```
+
+A few important notes:
+
+- bootc hosts track an image reference for future updates
+- `localhost/...` is convenient for local artifact creation, but deployed nodes cannot use it as a normal remote update source
+- if you prefer immutable version tags, either keep hosts tracking a moving tag such as `:stable` or switch them to a new ref during maintenance with `bootc switch`
+
+### Optional image build knobs
+
+Examples:
+
+```bash
+# Disable the best-effort 45Drives Cockpit plugin install
+ENABLE_45DRIVES=0 ./bootc/build-images.sh
+
+# Build from a different base reference
+BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9 ./bootc/build-images.sh
+```
+
+## Generate install media or VM artifacts
+
+### Installer ISO (recommended for bare metal)
+
+Create one installer per node so hostname and management addressing are baked into the kickstart.
+
+```bash
+./bootc/build-artifacts.sh \
+  -i "${STORAGE_IMAGE:-localhost/ha-san-storage:latest}" \
+  -t bootc-installer \
+  -c bootc/configs/storage-a-installer.example.toml \
+  -o bootc/output-storage-a-iso
+
+./bootc/build-artifacts.sh \
+  -i "${STORAGE_IMAGE:-localhost/ha-san-storage:latest}" \
+  -t bootc-installer \
+  -c bootc/configs/storage-b-installer.example.toml \
+  -o bootc/output-storage-b-iso
+
+./bootc/build-artifacts.sh \
+  -i "${QUORUM_IMAGE:-localhost/ha-san-quorum:latest}" \
+  -t bootc-installer \
+  -c bootc/configs/quorum-installer.example.toml \
+  -o bootc/output-quorum-iso
+```
+
+Use the installer example TOMLs only after replacing all placeholders.
+
+### QCOW2 or RAW image
+
+Useful for virtual testbeds or alternative provisioning pipelines.
+
+```bash
+./bootc/build-artifacts.sh \
+  -i "${STORAGE_IMAGE:-localhost/ha-san-storage:latest}" \
+  -t qcow2 \
+  -c bootc/configs/qcow2-user.example.toml \
+  -o bootc/output-storage-qcow2
+
+./bootc/build-artifacts.sh \
+  -i "${QUORUM_IMAGE:-localhost/ha-san-quorum:latest}" \
+  -t raw \
+  -c bootc/configs/qcow2-user.example.toml \
+  -o bootc/output-quorum-raw
+```
+
+Notes:
+
+- the generic bootc base image does not include a default login user
+- `qcow2-user.example.toml` is meant for qcow2/raw image builds
+- the installer TOMLs already use kickstart to create the admin user
+- do **not** mix a `[customizations.user]` block with an installer kickstart in the same build config
+
+## Install the three nodes
+
+Install the generated artifacts onto:
+
+- `storage-a` with the storage image
+- `storage-b` with the storage image
+- `quorum` with the quorum image
+
+After first boot, confirm:
+
+- each node came up with the expected hostname
+- management networking is correct
+- the OS landed on the dedicated install disk
+- you can SSH in as `storageadmin`
+
+## Bootstrap the cluster with Ansible
+
+Once the three nodes are installed and reachable, run the existing playbook in bootc mode:
+
+```bash
 ./bootc/bootstrap-cluster.sh --ask-vault-pass
 ```
 
-See `bootc/README.md` for the full workflow, node-specific installer examples, and rolling update guidance.
-
-## Quick Start
+That expands to:
 
 ```bash
-# 1. Clone/copy this directory
-# 2. Edit inventory and variables:
-vim inventory.yml                          # Set hostnames and IPs
-vim group_vars/all.yml                     # Cluster name, VLANs, VIPs, SSH key
-vim group_vars/storage_nodes/cluster.yml   # STONITH config
-vim group_vars/storage_nodes/iscsi.yml     # CHAP credentials
-vim host_vars/storage-a.yml               # Disk devices, IPs
-vim host_vars/storage-b.yml               # Disk devices, IPs
+ansible-playbook -i inventory.yml site.yml -e bootc_skip_packages=true
+```
 
-# 3. Vault your secrets (recommended)
-ansible-vault encrypt_string 'your-password' --name 'hacluster_password'
-ansible-vault encrypt_string 'your-chap-pass' --name 'iscsi_chap_password'
+This reuses the existing roles for:
 
-# 4. Run the playbook
-ansible-playbook -i inventory.yml site.yml --ask-vault-pass
+- common host configuration
+- hardening and firewall rules
+- optional interface/networking management
+- iSCSI target and initiator configuration
+- Corosync and Pacemaker cluster formation
+- NFS, SMB, and client-facing iSCSI configuration
+- Cockpit and monitoring deployment
 
-# 5. Manual steps (SSH to storage-a):
-#    a. Verify iSCSI sessions:
+## Manual steps that remain on purpose
+
+After Ansible finishes, log in to the current active storage node (normally `storage-a`) and complete the operator-reviewed steps:
+
+```bash
+# 1. Confirm the peer iSCSI sessions exist
 iscsiadm -m session
-#    b. Edit and run pool creation:
-vim /root/create-pool.sh   # Fix REMOTE_DISKS paths
+
+# 2. Review the generated pool-creation helper and fix any path mismatches
+vim /root/create-pool.sh
 bash /root/create-pool.sh
-#    c. Export pool for Pacemaker:
+
+# 3. Export the pool so Pacemaker can own it
 zpool export san-pool
-#    d. Configure STONITH:
+
+# 4. Configure fencing after verifying the fence devices are correct
 bash /root/configure-stonith.sh
-#    e. Configure Pacemaker resources:
+
+# 5. Create Pacemaker resources after the pool exists
 bash /root/configure-pacemaker-resources.sh
 ```
 
-## What's Automated vs. Manual
+These steps are intentionally manual because:
 
-| Step | Automated | Manual | Why |
-|------|-----------|--------|-----|
-| OS packages + repos | ✅ | | Deterministic |
-| Security hardening | ✅ | | Deterministic |
-| ZFS installation | ✅ | | Deterministic |
-| LIO target setup | ✅ | | Per-host config |
-| open-iscsi setup | ✅ | | Per-host config |
-| Corosync/Pacemaker install | ✅ | | Deterministic |
-| Cluster formation | ✅ | | Idempotent |
-| NFS/SMB/iSCSI config files | ✅ | | Templates |
-| ZFS pool creation | | ✅ | iSCSI paths vary |
-| STONITH configuration | | ✅ | Destructive — test first |
-| Pacemaker resources | | ✅ | Depends on pool existing |
+- ZFS pool creation is destructive and depends on verified iSCSI device paths
+- fencing mistakes can power-cycle the wrong host
+- Pacemaker resource creation depends on the real pool and service state
 
-The manual steps are deliberate. Pool creation requires verifying that iSCSI
-device paths (`/dev/disk/by-path/...`) match between what the playbook expects
-and what the kernel actually assigned. STONITH configuration is kept manual
-because a misconfigured fencing agent can power-cycle your nodes unexpectedly.
+## Verification
 
-## Tags
+Run the read-only verification playbook:
 
 ```bash
-# Run specific phases:
-ansible-playbook -i inventory.yml site.yml --tags base       # OS + hardening
-ansible-playbook -i inventory.yml site.yml --tags storage    # ZFS + iSCSI
-ansible-playbook -i inventory.yml site.yml --tags cluster    # Pacemaker
-ansible-playbook -i inventory.yml site.yml --tags services   # NFS/SMB configs
-ansible-playbook -i inventory.yml site.yml --tags cockpit    # Houston UI
-ansible-playbook -i inventory.yml site.yml --tags monitoring # monitoring exporters
+ansible-playbook -i inventory.yml verify.yml
 ```
 
-## Directory Structure
-
-```
-ha-san-ansible/
-├── site.yml                    # Main playbook
-├── os-upgrade.yml              # Rolling OS upgrade helper (always use --limit)
-├── verify.yml                  # Post-deployment verification
-├── inventory.yml               # Host inventory
-├── group_vars/
-│   ├── all.yml                 # Cluster-wide variables
-│   └── storage_nodes/
-│       ├── cluster.yml         # STONITH config, Pacemaker tuning
-│       ├── iscsi.yml           # iSCSI CHAP credentials, queue depth
-│       ├── network.yml         # Interface names, TCP tuning
-│       ├── services.yml        # NFS exports, SMB shares
-│       └── zfs.yml             # ZFS pool, datasets, scrub, Sanoid
-├── host_vars/
-│   ├── storage-a.yml           # Node A disks, IPs, IQNs
-│   ├── storage-b.yml           # Node B disks, IPs, IQNs
-│   └── quorum.yml              # Quorum node config
-└── roles/
-    ├── common/                 # Base packages, NTP, /etc/hosts
-    ├── hardening/              # SSH, nftables, sysctl, PAM
-    ├── zfs/                    # ZFS install, tunables, Sanoid
-    ├── iscsi-target/           # LIO targetcli setup
-    ├── iscsi-initiator/        # open-iscsi + pool creation helper
-    ├── pacemaker/              # Corosync + Pacemaker cluster
-    ├── services/               # NFS, SMB, iSCSI client config
-    ├── cockpit/                # Cockpit + 45Drives Houston
-    ├── monitoring/             # Monitoring exporters (node, ZFS, cluster, STONITH)
-    └── networking/             # Interface/VLAN config (opt-in)
-```
-
-## Post-Deployment Testing
-
-After the manual steps are complete, run through this checklist:
+Useful checks after the initial cutover:
 
 ```bash
-# Verify cluster health
 pcs status
+zpool status san-pool
+iscsiadm -m session
+bootc status
+```
 
-# Test planned failover (~5-8s)
+Recommended planned failover test:
+
+```bash
 pcs resource move zfs-pool storage-b
 pcs resource clear zfs-pool
-
-# Test unplanned failover (~10-12s) — PULL THE POWER CORD on active node
-# Verify clients reconnect within 15-25s total
-
-# Test STONITH (WARNING: this WILL power off the node — only run in maintenance)
-pcs stonith fence storage-b
-
-# Verify resilver after recovery
-zpool status san-pool
-
-# Verify ZFS scrub automation
-systemctl status zfs-scrub@san-pool.timer
-systemctl list-timers zfs-scrub@san-pool.timer
-
-# Manually trigger a scrub (safe to test)
-systemctl start zfs-scrub@san-pool.service
-journalctl -u zfs-scrub@san-pool.service -f
-
-# Check scrub progress
-zpool status san-pool
 ```
 
-## Cockpit Web Interface
+## Day-2 updates on bootc hosts
 
-Access Cockpit at:
-- **Active node VIP:** `https://10.20.20.10:9090` (recommended)
-- Direct node access: `https://10.20.20.1:9090` (storage-a) or `https://10.20.20.2:9090` (storage-b)
+For bootc deployments, update the base OS by building and publishing a new image revision, then upgrade nodes one at a time.
 
-**Features:**
-- 45Drives Houston plugins for ZFS, NFS, SMB management
-- File browser (cockpit-navigator)
-- User/group management (cockpit-identities)
-- System monitoring
+Recommended order:
 
-**Configuration sync:**
-- NFS exports: `/etc/exports` → symlinked to `/san-pool/cluster-config/nfs/exports`
-- SMB config: `/etc/samba/smb.conf` → symlinked to `/san-pool/cluster-config/samba/smb.conf`
-- Samba users: `/var/lib/samba/private/` → symlinked to `/san-pool/cluster-config/samba/private/`
-- Changes via Cockpit automatically sync between nodes during failover ✅
+1. `quorum`
+2. the standby storage node
+3. the active storage node
 
-**Documentation:** See `docs/cockpit-ha-config.md` for detailed HA configuration guide, troubleshooting, and verification steps.
+### On the node being updated
 
-## Customization Points
+Option A: stage first, then apply during the maintenance window:
 
-- **Disk layout**: Edit `local_data_disks` in `host_vars/` for your drives
-- **VLANs/subnets**: Edit `vlans` dict in `group_vars/all.yml`
-- **STONITH method**: Configure per-node in `stonith_nodes` dict in `group_vars/storage_nodes/cluster.yml`
-  - Supports mixed methods: storage-a can use IPMI while storage-b uses smart plug
-  - Smart plug guide: `docs/stonith-smart-plugs.md` (TP-Link Kasa, ESPHome, Tasmota)
-- **Snapshot policy**: Edit `sanoid_templates` in `group_vars/storage_nodes/zfs.yml`
-- **ZFS scrub schedule**: Edit `zfs_scrub_schedule` in `group_vars/storage_nodes/zfs.yml` (default: monthly on 1st at 2 AM)
-  - Use systemd OnCalendar syntax: `"*-*-01 02:00:00"` = 1st of month at 2am
-  - Disable with `zfs_scrub_enabled: false`
-  - Monitoring: See `docs/ntfy-integration.md` for Prometheus + NTFY alerting setup
-- **SMB shares**: Add entries to `smb_shares` list
-- **NFS exports**: Add entries to `nfs_exports` list
-- **iSCSI zvols**: Create manually with `zfs create -V <size> san-pool/iscsi/<name>`
-
-## Monitoring and Alerting
-
-This playbook deploys comprehensive monitoring for both storage and cluster health:
-
-### Node-Level Metrics (node_exporter:9100)
-- CPU, memory, disk, network, systemd services
-- Deployed on all nodes (storage-a, storage-b, quorum)
-
-### ZFS Storage Metrics (custom exporter, updated every 5 min)
-- `zfs_scrub_last_run_timestamp_seconds` - When last scrub completed
-- `zfs_scrub_last_run_errors_total` - Errors found in last scrub
-- `zfs_scrub_in_progress` - Whether scrub is currently running
-- `zfs_scrub_pool_health` - Pool health status (0=ONLINE, 1=DEGRADED, etc.)
-- `zfs_scrub_pool_imported` - Whether pool is imported on this node
-- `zfs_pool_size_bytes`, `zfs_pool_allocated_bytes`, `zfs_pool_free_bytes` - Pool capacity
-- `zfs_pool_fragmentation_percent` - Pool fragmentation percentage
-- `zfs_vdev_read_errors`, `zfs_vdev_write_errors`, `zfs_vdev_cksum_errors` - Per-vdev I/O errors
-- `zfs_resilver_in_progress`, `zfs_resilver_percent_complete` - Resilver status
-- `zfs_dataset_last_snapshot_seconds` - Timestamp of most recent Sanoid snapshot per dataset
-
-### Hardware Health Metrics (custom exporters, updated every 5 min)
-- `node_disk_smart_*` - SMART disk health: healthy status, temperature, reallocated sectors, power-on hours, NVMe-specific metrics (smart-exporter, storage nodes only)
-- `node_memory_correctable_errors_total`, `node_memory_uncorrectable_errors_total` - RAS/ECC hardware memory errors (ras-exporter, storage nodes only)
-- `node_nic_temperature_celsius`, `node_nic_sfp_temperature_celsius`, `node_hba_temperature_celsius` - NIC/HBA hardware temperatures (hwtemp-exporter, storage nodes only)
-
-### STONITH Probe Metrics (stonith-probe exporter, updated every 2 min)
-- `stonith_agent_reachable` - Whether each fence agent IP is pingable (storage nodes only)
-
-### OS Reboot Metrics (reboot-required exporter, updated every 15 min)
-- `node_reboot_required` - Whether a system reboot is pending (all nodes)
-
-### Cluster Health Metrics (ha_cluster_exporter:9664, updated every 30 sec)
-- `ha_cluster_corosync_quorate` - Cluster quorum status
-- `ha_cluster_pacemaker_nodes` - Node online/offline status
-- `ha_cluster_pacemaker_resources` - Resource health and location
-- `ha_cluster_pacemaker_fail_count` - Resource failure counts
-- `ha_cluster_pacemaker_stonith_enabled` - STONITH status
-- `ha_cluster_corosync_rings` - Corosync ring health
-
-**Documentation**:
-- Cluster monitoring guide: `docs/cluster-monitoring.md`
-- STONITH smart plug setup: `docs/stonith-smart-plugs.md`
-- Hardware/software watchdog: `docs/watchdog.md`
-- Ubuntu/AlmaLinux-specific notes: `docs/ubuntu-notes.md`
-- Rolling OS upgrade guide: `docs/os-upgrade.md`
-- iSCSI path recovery: `docs/iscsi-recovery.md`
-- NFS client configuration: `docs/nfs-client-config.md`
-- Cockpit HA configuration: `docs/cockpit-ha-config.md`
-- Example Prometheus alert rules: `docs/prometheus-alerts.yml`
-- Prometheus recording rules: `docs/prometheus-recording-rules.yml`
-- NTFY integration + dead-man's switch: `docs/ntfy-integration.md`
-- NFS authentication levels: `docs/nfs-security.md`
-- ZFS dataset configuration by workload: `docs/dataset-best-practices.md`
-
-**Alert Coverage**:
-- Storage: overdue scrubs, scrub errors, pool degradation, split-brain, capacity, vdev errors, resilver stalls, snapshot age
-- Cluster: quorum loss, node offline, resource failures, stuck resource transitions, STONITH unreachable, failover detection
-- Services: NFS/SMB resource stopped
-- OS: reboot required, memory pressure
-- Pipeline: Watchdog dead-man's switch (Uptime Kuma)
-
-**Grafana Dashboard**: Import dashboard #12229 from Grafana.com for pre-built cluster visualization.
-
-**Quick Check**:
 ```bash
-# View ZFS metrics
-curl http://10.20.20.1:9100/metrics | grep zfs_scrub
-
-# View cluster metrics
-curl http://10.20.20.1:9664/metrics | grep ha_cluster
-
-# Check exporters
-systemctl status zfs-scrub-exporter.timer
-systemctl status prometheus-hacluster-exporter
-systemctl status stonith-probe.timer
-systemctl status reboot-required-exporter.timer
+sudo bootc upgrade --download-only
+sudo bootc status --verbose
+sudo bootc upgrade --from-downloaded --apply
 ```
 
-## Rolling OS Upgrade
-
-Use `os-upgrade.yml` to upgrade one node at a time with automated health checks and failover handling. See `docs/os-upgrade.md` for the full procedure.
+Option B: fetch and apply immediately:
 
 ```bash
-# Pre-upgrade: safety checks, standby, failover (if active node)
-ansible-playbook -i inventory.yml os-upgrade.yml --tags pre-upgrade --limit storage-b
-
-# (Upgrade the OS manually, then re-apply Ansible)
-ansible-playbook -i inventory.yml site.yml --limit storage-b
-
-# Post-upgrade: verify services, iSCSI, rejoin cluster
-ansible-playbook -i inventory.yml os-upgrade.yml --tags post-upgrade --limit storage-b
+sudo bootc upgrade --apply
 ```
 
-Upgrade order: quorum → standby storage node → active storage node.
-
-## Re-Deploying and Rollback
-
-Almost all tasks in this playbook are idempotent. Re-running with a tag is the standard
-rollback/re-apply mechanism after manual changes:
+If you need to change the image ref the host tracks, use:
 
 ```bash
-# Re-apply hardening after a manual change (firewall, sysctl, SSH config)
+sudo bootc switch registry.example.com/ha-san/storage:stable
+```
+
+Rollback path:
+
+```bash
+sudo bootc rollback
+sudo reboot
+```
+
+Operational guidance:
+
+- always evacuate or fail over storage resources before rebooting a storage node
+- wait for the upgraded storage node to rejoin cleanly before touching the peer
+- if the pool resilvers after a node return, wait for the resilver to complete before upgrading the other storage node
+- for bootc hosts, prefer this workflow over the package-manager procedure in `docs/os-upgrade.md`
+
+## Reapplying configuration with tags
+
+Most repo-managed configuration remains idempotent and can be re-applied with tags.
+
+```bash
 ansible-playbook -i inventory.yml site.yml --tags base
-
-# Re-apply ZFS tuning (ARC, txg_timeout, scrub schedule)
 ansible-playbook -i inventory.yml site.yml --tags storage
-
-# Re-apply cluster config (corosync.conf, STONITH script, pcs properties)
 ansible-playbook -i inventory.yml site.yml --tags cluster
-
-# Re-apply NFS/SMB config files (exports, smb.conf, iscsid.conf)
 ansible-playbook -i inventory.yml site.yml --tags services
-
-# Re-apply monitoring exporters
+ansible-playbook -i inventory.yml site.yml --tags cockpit
 ansible-playbook -i inventory.yml site.yml --tags monitoring
-
-# Dry run before applying — always safe
-ansible-playbook -i inventory.yml site.yml --check --diff --tags <role>
 ```
 
-**What is NOT idempotent (manual steps):**
-- `create-pool.sh` — pool creation is irreversible; run once after verifying disk paths
-- `configure-stonith.sh` — regenerated by Ansible but must be manually run; test fencing
-  before running in production
-- `configure-pacemaker-resources.sh` — regenerated by Ansible; `pcs` commands use
-  `|| true` guards to skip already-existing resources
+Dry run:
 
-**Undoing a manual pcs change:**
 ```bash
-# Clear all resource constraints (returns to Ansible-defined state)
-pcs constraint remove --all  # then re-run configure-pacemaker-resources.sh
-
-# Reset resource failure counts
-pcs resource cleanup <resource>
-
-# Remove a resource (if accidentally misconfigured)
-pcs resource remove <resource>  # then re-run configure-pacemaker-resources.sh
+ansible-playbook -i inventory.yml site.yml --check --diff
 ```
+
+## Legacy mutable deployment path
+
+If you are not using bootc yet:
+
+```bash
+ansible-playbook -i inventory.yml site.yml --ask-vault-pass
+```
+
+That path expects a fresh supported OS install on each node and lets Ansible manage packages directly. For rolling mutable-node upgrades, see:
+
+- `os-upgrade.yml`
+- `docs/os-upgrade.md`
+
+## Additional documentation
+
+Use these docs for deeper operational details:
+
+- `bootc/README.md` — image-build details and artifact generation
+- `docs/ha-san-design.md` — architecture and failover model
+- `docs/ha-san-ops.md` — operations and maintenance guidance
+- `docs/variables.md` — variable reference
+- `docs/cluster-monitoring.md` — exporters, metrics, and alerting
+- `docs/cockpit-ha-config.md` — Cockpit in an HA layout
+- `docs/stonith-smart-plugs.md` — Kasa, ESPHome, Tasmota, and HTTP fencing patterns
+- `docs/watchdog.md` — watchdog guidance
+- `docs/iscsi-recovery.md` — path and session recovery
+- `docs/dataset-best-practices.md` — workload-oriented dataset layout guidance
+
+## Summary
+
+This repo is now organized around a **bootc-first** deployment model:
+
+1. build a bootable storage image and quorum image
+2. turn those images into node install artifacts
+3. install the three nodes
+4. run the existing Ansible automation in `bootc_skip_packages=true` mode
+5. complete the explicit storage-cluster manual steps
+6. maintain the hosts with rolling `bootc upgrade` and `bootc rollback`
+
+That keeps the HA SAN behavior and Ansible logic you already had, while making the host OS easier to deploy, standardize, update, and recover.
