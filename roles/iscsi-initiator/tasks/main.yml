@@ -1,0 +1,73 @@
+---
+# roles/iscsi-initiator/tasks/main.yml — Backend open-iscsi initiator (always running)
+
+- name: Load OS-family variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Load distribution-specific variable overrides
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}-{{ ansible_distribution_major_version }}.yml"
+        - "{{ ansible_distribution }}.yml"
+      paths:
+        - "{{ role_path }}/vars"
+      skip: true
+  when: ansible_distribution != ansible_os_family
+
+- name: Install open-iscsi
+  ansible.builtin.package:
+    name: "{{ _iscsi_initiator_packages }}"
+    state: present
+  when: not (bootc_skip_packages | default(false))
+
+- name: Set initiator name
+  ansible.builtin.copy:
+    dest: /etc/iscsi/initiatorname.iscsi
+    content: "InitiatorName={{ iscsi_initiator_name }}\n"
+    mode: "0600"
+  notify: restart iscsid
+
+- name: Deploy iscsid.conf with aggressive-safe timeouts
+  ansible.builtin.template:
+    src: iscsid.conf.j2
+    dest: /etc/iscsi/iscsid.conf
+    mode: "0600"
+  notify: restart iscsid
+  no_log: true
+
+- name: Enable iSCSI services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: "{{ _iscsi_initiator_services }}"
+
+- name: Discover peer iSCSI targets
+  ansible.builtin.command:
+    cmd: iscsiadm -m discovery -t sendtargets -p {{ iscsi_peer_ip }}:3260
+  register: iscsi_discovery
+  changed_when: false
+  failed_when: false
+
+- name: Log in to peer targets
+  ansible.builtin.command:
+    cmd: iscsiadm -m node -T {{ iscsi_peer_iqn }} -p {{ iscsi_peer_ip }}:3260 --login
+  register: iscsi_login
+  changed_when: "'already present' not in iscsi_login.stderr"
+  failed_when: false
+  when: iscsi_discovery.rc == 0
+
+- name: Set node to auto-login on boot
+  ansible.builtin.command:
+    cmd: iscsiadm -m node -T {{ iscsi_peer_iqn }} -p {{ iscsi_peer_ip }}:3260 -o update -n node.startup -v automatic
+  changed_when: false
+  failed_when: false
+  when: iscsi_discovery.rc == 0
+
+- name: Generate ZFS pool creation helper script (active node only)
+  ansible.builtin.template:
+    src: create-pool.sh.j2
+    dest: /root/create-pool.sh
+    mode: "0700"
+  when: inventory_hostname == pacemaker_preferred_node

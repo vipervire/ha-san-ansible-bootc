@@ -1,0 +1,39 @@
+---
+- name: restart sshd
+  ansible.builtin.systemd:
+    name: sshd
+    state: restarted
+
+- name: reload hardening sysctl
+  ansible.builtin.command:
+    cmd: sysctl --system
+
+- name: restart nftables
+  ansible.builtin.systemd:
+    name: nftables
+    state: restarted
+
+- name: restart auditd
+  ansible.builtin.systemd:
+    name: auditd
+    state: restarted
+
+- name: restart rsyslog
+  ansible.builtin.systemd:
+    name: rsyslog
+    state: restarted
+
+- name: restart watchdog
+  ansible.builtin.systemd:
+    name: watchdog
+    state: restarted
+
+- name: reload watchdog module
+  # Re-load the module so updated modprobe options take effect without rebooting.
+  # Stops the watchdog daemon first to release the device, then reloads the module.
+  ansible.builtin.shell: |
+    systemctl stop watchdog || true
+    modprobe -r {{ watchdog_module }}
+    modprobe {{ watchdog_module }}
+    systemctl start watchdog || true
+  when: watchdog_module | default('') | length > 0

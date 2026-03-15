@@ -1,0 +1,98 @@
+#!/usr/sbin/nft -f
+# Managed by Ansible — HA SAN firewall rules
+# Node: {{ inventory_hostname }}
+
+flush ruleset
+
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    # Loopback always allowed
+    iif lo accept
+
+    # Established/related connections
+    ct state established,related accept
+
+    # ICMP (ping) — useful for diagnostics
+    ip protocol icmp accept
+
+{% if inventory_hostname in groups['storage_nodes'] %}
+    # ─── Storage VLAN ({{ vlans.storage.id }}) — iSCSI from peer only ───
+    ip saddr {{ vlans.storage.subnet }} tcp dport 3260 accept
+
+    # ─── Client VLANs — per-VLAN service filtering ──────────────────────
+{% for cv in client_vlans %}
+    # {{ cv.name }} (VLAN {{ cv.id }}): {{ cv.services | join(', ') }}
+{% if 'nfs' in cv.services %}
+    ip saddr {{ cv.subnet }} tcp dport 2049 accept
+{% if nfs_v3_enabled | default(false) %}
+    ip saddr {{ cv.subnet }} tcp dport { 20048, 111 } accept
+    ip saddr {{ cv.subnet }} udp dport 111 accept
+{% endif %}
+{% endif %}
+{% if 'smb' in cv.services %}
+    ip saddr {{ cv.subnet }} tcp dport 445 accept
+{% endif %}
+{% if 'iscsi' in cv.services %}
+    ip saddr {{ cv.subnet }} tcp dport 3260 accept
+{% endif %}
+{% if 'ssh' in cv.services %}
+    ip saddr {{ cv.subnet }} tcp dport {{ ssh_port }} accept
+{% endif %}
+{% endfor %}
+{% endif %}
+
+    # ─── Management VLAN ({{ vlans.management.id }}) ────────────────────
+    # SSH
+    ip saddr {{ vlans.management.subnet }} tcp dport {{ ssh_port }} accept
+
+    # Corosync (knet)
+    ip saddr {{ vlans.management.subnet }} udp dport 5405 accept
+
+    # pcsd (Pacemaker web) — rate limited to protect against brute-force
+{% if firewall_rate_limit_enabled | default(true) %}
+    ip saddr {{ vlans.management.subnet }} tcp dport 2224 ct state new limit rate 10/minute burst 30 packets accept
+{% else %}
+    ip saddr {{ vlans.management.subnet }} tcp dport 2224 accept
+{% endif %}
+
+    # Cockpit web UI — rate limited to protect against brute-force
+{% if firewall_rate_limit_enabled | default(true) %}
+    ip saddr {{ vlans.management.subnet }} tcp dport 9090 ct state new limit rate 10/minute burst 30 packets accept
+{% else %}
+    ip saddr {{ vlans.management.subnet }} tcp dport 9090 accept
+{% endif %}
+
+    # Prometheus node_exporter
+    ip saddr {{ vlans.management.subnet }} tcp dport 9100 accept
+
+    # Prometheus ha_cluster_exporter (Pacemaker/Corosync metrics)
+    ip saddr {{ vlans.management.subnet }} tcp dport 9664 accept
+
+{% if syslog_remote_enabled | default(false) %}
+    # Remote syslog receiver
+{% if syslog_remote_protocol | default('udp') == 'tcp' %}
+    ip saddr {{ vlans.management.subnet }} tcp dport {{ syslog_remote_port | default(514) }} accept
+{% else %}
+    ip saddr {{ vlans.management.subnet }} udp dport {{ syslog_remote_port | default(514) }} accept
+{% endif %}
+{% endif %}
+
+{% if inventory_hostname in groups['storage_nodes'] %}
+    # Corosync on storage VLAN (ring1 redundancy)
+    ip saddr {{ vlans.storage.subnet }} udp dport 5405 accept
+{% endif %}
+
+    # Log + drop everything else
+    log prefix "nft-drop: " counter drop
+  }
+
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+  }
+
+  chain output {
+    type filter hook output priority 0; policy accept;
+  }
+}

@@ -1,0 +1,33 @@
+#!/bin/bash
+# Managed by Ansible — exports whether a system reboot is pending
+
+TEXTFILE_DIR="/var/lib/prometheus/node-exporter"
+TEXTFILE="${TEXTFILE_DIR}/reboot_required.prom"
+TEXTFILE_TMP="${TEXTFILE}.$$"
+
+mkdir -p "${TEXTFILE_DIR}"
+
+reboot_needed=0
+
+{% if ansible_os_family == 'Debian' %}
+# Debian: check for /var/run/reboot-required (set by unattended-upgrades)
+if [ -f /var/run/reboot-required ]; then
+    reboot_needed=1
+fi
+{% elif ansible_os_family == 'RedHat' %}
+# Rocky/RHEL: use needs-restarting to check if a reboot is needed
+if command -v needs-restarting &>/dev/null; then
+    if ! needs-restarting -r &>/dev/null; then
+        reboot_needed=1
+    fi
+fi
+{% endif %}
+
+{
+    echo "# HELP node_reboot_required Whether a system reboot is pending (1=yes, 0=no)"
+    echo "# TYPE node_reboot_required gauge"
+    echo "node_reboot_required ${reboot_needed}"
+} > "${TEXTFILE_TMP}"
+
+mv "${TEXTFILE_TMP}" "${TEXTFILE}"
+chmod 644 "${TEXTFILE}"

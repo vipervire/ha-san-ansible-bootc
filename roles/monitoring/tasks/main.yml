@@ -1,0 +1,157 @@
+---
+# roles/monitoring/tasks/main.yml — Prometheus exporters for HA SAN nodes
+
+- name: Load OS-family variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Load distribution-specific variable overrides
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}-{{ ansible_distribution_major_version }}.yml"
+        - "{{ ansible_distribution }}.yml"
+      paths:
+        - "{{ role_path }}/vars"
+      skip: true
+  when: ansible_distribution != ansible_os_family
+
+- name: Include OS-specific monitoring package installation
+  ansible.builtin.include_tasks: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}.yml"
+        - "{{ ansible_os_family }}.yml"
+      paths:
+        - "{{ role_path }}/tasks"
+  when: not (bootc_skip_packages | default(false))
+
+# ─── Shared monitoring configuration (OS-independent) ───────────────────────
+
+- name: Configure node_exporter to listen on management VLAN only
+  ansible.builtin.copy:
+    dest: "{{ _node_exporter_env_file }}"
+    mode: "0644"
+    content: |
+      ARGS="--web.listen-address={{ mgmt_ip | default('0.0.0.0') }}:9100 \
+        --collector.textfile.directory=/var/lib/prometheus/node-exporter \
+        {% if node_exporter_tls_enabled | default(false) %}--web.config.file=/etc/prometheus/node-exporter-web.yml{% endif %}"
+  notify: restart node_exporter
+
+- name: Create prometheus config directory
+  ansible.builtin.file:
+    path: /etc/prometheus
+    state: directory
+    mode: "0755"
+  when: node_exporter_tls_enabled | default(false)
+
+- name: Deploy node_exporter web config (TLS)
+  ansible.builtin.template:
+    src: node-exporter-web.yml.j2
+    dest: /etc/prometheus/node-exporter-web.yml
+    mode: "0640"
+    owner: root
+    group: "{{ _node_exporter_group }}"
+  when: node_exporter_tls_enabled | default(false)
+  notify: restart node_exporter
+
+- name: Create textfile collector directory
+  ansible.builtin.file:
+    path: /var/lib/prometheus/node-exporter
+    state: directory
+    mode: "0755"
+    owner: "{{ _node_exporter_user }}"
+    group: "{{ _node_exporter_group }}"
+
+- name: Enable node_exporter service
+  ansible.builtin.systemd:
+    name: "{{ _node_exporter_service }}"
+    enabled: true
+    state: started
+
+# ─── Mellanox MFT (optional, for ConnectX-3 NIC chip temperature) ──────────
+- name: Load MFT OS-family vars
+  ansible.builtin.include_vars: "mft_{{ ansible_os_family }}.yml"
+  when:
+    - mellanox_mft_install | default(false)
+    - not (bootc_skip_packages | default(false))
+
+- name: Load MFT distribution overrides
+  ansible.builtin.include_vars: "mft_{{ ansible_distribution }}.yml"
+  when:
+    - mellanox_mft_install | default(false)
+    - not (bootc_skip_packages | default(false))
+  failed_when: false  # Ubuntu overlay may not exist — mft_Debian.yml already handles it
+
+- name: Install Mellanox Firmware Tools
+  ansible.builtin.include_tasks: "{{ item }}"
+  with_first_found:
+    - "mft_{{ ansible_distribution }}.yml"
+    - "mft_{{ ansible_os_family }}.yml"
+  when:
+    - mellanox_mft_install | default(false)
+    - not (bootc_skip_packages | default(false))
+
+# ─── Script-based timer exporters ─────────────────────────────────────────
+- name: Deploy timer-based exporters
+  ansible.builtin.include_tasks: deploy_timer_exporter.yml
+  loop:
+    - name: zfs-scrub-exporter
+      enabled: "{{ zfs_scrub_monitoring_enabled | default(true) }}"
+      storage_only: true
+    - name: reboot-required-exporter
+      enabled: true
+      storage_only: false
+    - name: stonith-probe
+      enabled: true
+      storage_only: true
+    - name: smart-exporter
+      enabled: "{{ smart_monitoring_enabled | default(true) }}"
+      storage_only: true
+    - name: ras-exporter
+      enabled: "{{ ras_monitoring_enabled | default(false) }}"
+      storage_only: false
+    - name: hwtemp-exporter
+      enabled: "{{ hwtemp_monitoring_enabled | default(true) }}"
+      storage_only: false
+  loop_control:
+    loop_var: exporter
+
+# ─── rasdaemon service ───────────────────────────────────────────────────
+- name: Enable rasdaemon service
+  ansible.builtin.systemd:
+    name: rasdaemon
+    enabled: true
+    state: started
+  when: ras_monitoring_enabled | default(false)
+
+# ─── HA Cluster Exporter (Pacemaker/Corosync metrics) ──────────────────────
+- name: Configure ha_cluster_exporter to listen on management VLAN only
+  ansible.builtin.template:
+    src: ha-cluster-exporter-default.j2
+    dest: "{{ _ha_cluster_exporter_env_file }}"
+    mode: "0644"
+  when:
+    - ha_cluster_monitoring_enabled | default(true)
+    - _ha_cluster_exporter_package | default('') | length > 0
+  notify: restart ha_cluster_exporter
+
+- name: Enable and start ha_cluster_exporter service
+  ansible.builtin.systemd:
+    name: "{{ _ha_cluster_exporter_service }}"
+    enabled: true
+    state: started
+  when:
+    - ha_cluster_monitoring_enabled | default(true)
+    - _ha_cluster_exporter_package | default('') | length > 0
+
+# ─── Alertmanager config generation (ntfy integration) ─────────────────────
+- name: Generate Alertmanager config for ntfy routing
+  ansible.builtin.template:
+    src: alertmanager.yml.j2
+    dest: /root/alertmanager-for-prometheus-server.yml
+    mode: "0640"
+  when: >
+    alertmanager_ntfy_url is defined and
+    alertmanager_ntfy_url | length > 0 and
+    inventory_hostname == pacemaker_preferred_node
+  run_once: true

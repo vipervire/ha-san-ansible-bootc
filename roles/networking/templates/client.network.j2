@@ -1,0 +1,10 @@
+# Managed by Ansible — client VLAN {{ cv.name }} ({{ cv.id }})
+# {{ cv.description | default(cv.services | join(', ')) }}
+[Match]
+Name={{ cv.name }}-vlan
+
+[Network]
+Address={{ client_ips[cv.name] }}/{{ cv.subnet.split('/')[1] }}
+
+[Link]
+MTUBytes={{ cv.mtu | default(9000) }}

@@ -1,0 +1,134 @@
+---
+# roles/networking/tasks/main.yml — Network interface configuration + TCP tuning
+#
+# Interface management is opt-in (networking_manage: true).
+# TCP performance tuning runs unconditionally on storage nodes when tcp_tunables
+# is defined — it does not require networking_manage to be enabled.
+#
+# WARNING: Enabling networking_manage on a running system may disrupt connectivity.
+#          Set networking_restart_on_change: true only during initial deployment.
+
+- name: Load OS-family variables
+  ansible.builtin.include_vars: "{{ ansible_os_family }}.yml"
+
+- name: Load distribution-specific variable overrides
+  ansible.builtin.include_vars: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}-{{ ansible_distribution_major_version }}.yml"
+        - "{{ ansible_distribution }}.yml"
+      paths:
+        - "{{ role_path }}/vars"
+      skip: true
+  when: ansible_distribution != ansible_os_family
+
+# ─── TCP performance tuning (storage nodes) ───────────────────────────────
+- name: Deploy TCP tuning sysctl settings
+  ansible.builtin.template:
+    src: 91-tcp-tuning.conf.j2
+    dest: /etc/sysctl.d/91-tcp-tuning.conf
+    mode: "0644"
+  when: tcp_tunables is defined
+  notify: reload network sysctl
+
+- name: Load tcp_bbr kernel module
+  community.general.modprobe:
+    name: tcp_bbr
+    state: present
+    persistent: present
+  when: >
+    tcp_tunables is defined and
+    (tcp_tunables['net.ipv4.tcp_congestion_control'] | default('')) == 'bbr'
+
+# ─── Interface configuration (opt-in) ─────────────────────────────────────
+- name: Include OS-specific network package installation
+  ansible.builtin.include_tasks: "{{ item }}"
+  with_first_found:
+    - files:
+        - "{{ ansible_distribution }}.yml"
+        - "{{ ansible_os_family }}.yml"
+      paths:
+        - "{{ role_path }}/tasks"
+  when: not (bootc_skip_packages | default(false))
+
+- name: Deploy management interface config
+  ansible.builtin.template:
+    src: mgmt.network.j2
+    dest: /etc/systemd/network/10-mgmt.network
+    mode: "0644"
+  when: networking_manage | default(false)
+  notify: restart networkd
+
+- name: Deploy storage interface config
+  ansible.builtin.template:
+    src: storage.network.j2
+    dest: /etc/systemd/network/20-storage.network
+    mode: "0644"
+  when:
+    - networking_manage | default(false)
+    - inventory_hostname in groups['storage_nodes']
+  notify: restart networkd
+
+- name: Gather unique client parent interfaces
+  ansible.builtin.set_fact:
+    _client_parent_ifaces: "{{ client_vlans | map(attribute='parent_interface', default=net_client_parent) | unique | list }}"
+  when:
+    - networking_manage | default(false)
+    - inventory_hostname in groups['storage_nodes']
+
+- name: Deploy client parent interface configs (one per physical NIC)
+  ansible.builtin.template:
+    src: client-parent.network.j2
+    dest: "/etc/systemd/network/29-client-{{ parent_iface }}.network"
+    mode: "0644"
+  loop: "{{ _client_parent_ifaces }}"
+  loop_control:
+    loop_var: parent_iface
+  when:
+    - networking_manage | default(false)
+    - inventory_hostname in groups['storage_nodes']
+  notify: restart networkd
+
+- name: Deploy client VLAN netdev configs
+  ansible.builtin.template:
+    src: client-vlan.netdev.j2
+    dest: "/etc/systemd/network/3{{ idx }}0-client-{{ cv.name }}.netdev"
+    mode: "0644"
+  loop: "{{ client_vlans }}"
+  loop_control:
+    loop_var: cv
+    index_var: idx
+  when:
+    - networking_manage | default(false)
+    - inventory_hostname in groups['storage_nodes']
+  notify: restart networkd
+
+- name: Deploy client VLAN interface configs
+  ansible.builtin.template:
+    src: client.network.j2
+    dest: "/etc/systemd/network/3{{ idx }}1-client-{{ cv.name }}.network"
+    mode: "0644"
+  loop: "{{ client_vlans }}"
+  loop_control:
+    loop_var: cv
+    index_var: idx
+  when:
+    - networking_manage | default(false)
+    - inventory_hostname in groups['storage_nodes']
+  notify: restart networkd
+
+- name: Remove legacy single-VLAN client network config
+  ansible.builtin.file:
+    path: /etc/systemd/network/30-client.network
+    state: absent
+  when:
+    - networking_manage | default(false)
+    - inventory_hostname in groups['storage_nodes']
+  notify: restart networkd
+
+- name: Enable systemd-networkd
+  ansible.builtin.systemd:
+    name: systemd-networkd
+    enabled: true
+    state: started
+  when: networking_manage | default(false)
