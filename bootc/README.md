@@ -1,26 +1,12 @@
-# bootc-based atomic deployment for the HA SAN
+# bootc deployment guide for the HA SAN
 
-This directory converts the mutable package-install portion of the Ansible deployment into **bootc-derived CentOS Stream 9 images**:
+This directory turns the mutable package-install portion of the HA SAN deployment into **bootc-derived CentOS Stream 9 images**.
 
-- `Containerfile.storage` builds the image used for `storage-a` and `storage-b`
-- `Containerfile.quorum` builds the smaller image used for `quorum`
-- `build-images.sh` builds the OCI images locally with Podman
-- `build-artifacts.sh` converts those OCI images into deployable artifacts such as `qcow2`, `raw`, or `bootc-installer` ISO images
-- `bootstrap-cluster.sh` reuses the existing Ansible playbook as the day-1 cluster bootstrap, with package installation disabled
+It keeps a clear split between:
 
-## Why this layout
-
-The original playbook mixes three kinds of work:
-
-1. OS/package/repository setup
-2. service and cluster configuration
-3. environment-specific manual steps (pool creation, STONITH validation, Pacemaker resource creation)
-
-`bootc` is a strong fit for **#1**, but #2 and #3 are still better expressed in Ansible and operator-reviewed scripts. The result is:
-
-- image build time installs the kernel, ZFS, iSCSI, Pacemaker, Cockpit, and monitoring packages
-- first deployment still uses your current inventory, variables, templates, handlers, and validation logic
-- manual storage-cluster steps remain explicit and visible
+1. **image build time** for the host OS, kernel, repositories, and packages
+2. **Ansible bootstrap time** for host configuration, clustering, services, templates, and monitoring
+3. **manual operator-reviewed steps** for destructive or environment-specific storage actions
 
 ## Contents
 
@@ -46,80 +32,116 @@ bootc/
     └── wheel-passwordless-sudo
 ```
 
+## What each image contains
+
+### `Containerfile.storage`
+
+Used for `storage-a` and `storage-b`.
+
+Bakes in:
+
+- CentOS Stream 9 bootc base
+- OpenZFS on EL9 with DKMS
+- iSCSI initiator and target packages
+- Pacemaker, Corosync, pcs, and fence agents
+- NFS, Samba, Cockpit, exporters, and supporting tools
+- optional 45Drives Cockpit plugins
+
+### `Containerfile.quorum`
+
+Used for `quorum`.
+
+Bakes in:
+
+- base admin and hardening packages
+- Pacemaker, Corosync, pcs, and fence agents
+- monitoring packages
+- no ZFS or storage-service stack
+
+## Defaults embedded in the image
+
+The image build drops several defaults into the bootc image itself:
+
+- `files/00-ha-san.toml` sets the installed root filesystem to `xfs`
+- `files/config.toml` sets minimum sizes for `/` and `/boot`
+- `files/prepare-root.conf` enables `composefs`
+- `bootc-fetch-apply-updates.timer` is masked so updates do not auto-apply during cluster operations
+
 ## Prerequisites
 
 On the build host:
 
 - Podman
-- enough local disk space for the image plus generated artifacts
-- if SELinux is enforcing, install `osbuild-selinux` before using `bootc-image-builder`
+- enough disk space for the images and generated artifacts
+- if SELinux is enforcing, install the OSBuild SELinux policy package required by `bootc-image-builder`
 
-On the deployment side:
+For deployment:
 
-- a registry or local container storage location reachable by the system building artifacts
-- static management IP details for each node
-- a dedicated OS boot disk that is **not** one of the SAN data disks
+- static management-network details for all three nodes
+- a dedicated OS install disk for each node
+- access to the resulting qcow2/raw/installer artifacts
+- ideally, a registry the deployed systems can reach for future `bootc upgrade`
 
 ## Build the images
 
-From the repository root:
+### Local testing
 
 ```bash
 ./bootc/build-images.sh
 ```
 
-By default this creates:
+This builds:
 
 - `localhost/ha-san-storage:latest`
 - `localhost/ha-san-quorum:latest`
 
-Optional environment variables:
+### Production-oriented build refs
+
+For ongoing bootc lifecycle management, use image refs that the installed systems can reach later.
 
 ```bash
-BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9 \
-ENABLE_45DRIVES=1 \
+export STORAGE_IMAGE=registry.example.com/ha-san/storage:stable
+export QUORUM_IMAGE=registry.example.com/ha-san/quorum:stable
 ./bootc/build-images.sh
+podman push "$STORAGE_IMAGE"
+podman push "$QUORUM_IMAGE"
 ```
 
-## Create deployable artifacts
+Important:
 
-### QCOW2 / RAW disk images
+- deployed systems track an image reference for `bootc upgrade`
+- `localhost/...` is useful for local artifact creation and lab work, but not as a normal remote update source for deployed hosts
+- if you later want hosts to follow a different image ref, use `bootc switch`
+
+Optional knobs:
 
 ```bash
-# Make a qcow2 image for a storage node VM
-./bootc/build-artifacts.sh \
-  -i localhost/ha-san-storage:latest \
-  -t qcow2 \
-  -c bootc/configs/qcow2-user.example.toml \
-  -o bootc/output-storage-qcow2
-
-# Make a raw image for bare metal or another pipeline
-./bootc/build-artifacts.sh \
-  -i localhost/ha-san-quorum:latest \
-  -t raw \
-  -c bootc/configs/qcow2-user.example.toml \
-  -o bootc/output-quorum-raw
+ENABLE_45DRIVES=0 ./bootc/build-images.sh
+BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9 ./bootc/build-images.sh
+PLATFORM=linux/amd64 ./bootc/build-images.sh
 ```
+
+## Build deployable artifacts
 
 ### Installer ISO
 
-Generate one installer per node so each ISO bakes in the right hostname and management addressing.
+Create one ISO per node so the hostname and static management IP are baked into kickstart.
 
 ```bash
 ./bootc/build-artifacts.sh \
-  -i localhost/ha-san-storage:latest \
+  -i "${STORAGE_IMAGE:-localhost/ha-san-storage:latest}" \
   -t bootc-installer \
   -c bootc/configs/storage-a-installer.example.toml \
   -o bootc/output-storage-a-iso
 
 ./bootc/build-artifacts.sh \
-  -i localhost/ha-san-storage:latest \
+  -i "${STORAGE_IMAGE:-localhost/ha-san-storage:latest}" \
   -t bootc-installer \
   -c bootc/configs/storage-b-installer.example.toml \
   -o bootc/output-storage-b-iso
 
 ./bootc/build-artifacts.sh \
-  -i localhost/ha-san-quorum:latest \
+  -i "${QUORUM_IMAGE:-localhost/ha-san-quorum:latest}" \
   -t bootc-installer \
   -c bootc/configs/quorum-installer.example.toml \
   -o bootc/output-quorum-iso
@@ -129,95 +151,113 @@ Before using the example installer configs:
 
 - replace every `<PLACEHOLDER>` value
 - point `ignoredisk --only-use=` at the dedicated OS disk
-- confirm the management NIC name is correct
-- generate the user password hash with `openssl passwd -6`
+- verify the management NIC name
+- generate the password hash with `openssl passwd -6`
+
+### QCOW2 or RAW image
+
+```bash
+./bootc/build-artifacts.sh \
+  -i "${STORAGE_IMAGE:-localhost/ha-san-storage:latest}" \
+  -t qcow2 \
+  -c bootc/configs/qcow2-user.example.toml \
+  -o bootc/output-storage-qcow2
+
+./bootc/build-artifacts.sh \
+  -i "${QUORUM_IMAGE:-localhost/ha-san-quorum:latest}" \
+  -t raw \
+  -c bootc/configs/qcow2-user.example.toml \
+  -o bootc/output-quorum-raw
+```
+
+Notes:
+
+- the generic bootc base image does not include a default user
+- `qcow2-user.example.toml` is intended for qcow2/raw builds
+- the installer TOMLs already create the admin user through kickstart
+- do not combine `[[customizations.user]]` with an installer kickstart in the same config
 
 ## Install the nodes
 
-Install the generated artifacts on:
+Install:
 
-- `storage-a` using the storage image
-- `storage-b` using the storage image
-- `quorum` using the quorum image
+- `storage-a` from the storage image
+- `storage-b` from the storage image
+- `quorum` from the quorum image
 
-After first boot, confirm SSH access as the configured admin user.
+After first boot, verify:
 
-## Run the existing cluster bootstrap
+- hostname
+- management IP and routing
+- SSH access as `storageadmin`
+- the OS was installed to the correct disk
 
-Once the nodes are installed and reachable, reuse the current playbook while skipping package installation:
+## Bootstrap the cluster with Ansible
+
+Once all three nodes are installed and reachable:
 
 ```bash
 ./bootc/bootstrap-cluster.sh --ask-vault-pass
 ```
 
-That wrapper expands to:
+This runs:
 
 ```bash
 ansible-playbook -i inventory.yml site.yml -e bootc_skip_packages=true
 ```
 
-What still happens in Ansible:
+That reuses the existing playbook for:
 
-- SSH key/user setup and local policy configuration
-- nftables, sysctl, PAM, watchdog, and service configuration
-- iSCSI target/initiator configuration
-- Corosync/Pacemaker cluster formation
-- NFS/SMB/iSCSI client-facing service configuration
-- monitoring exporters and timers
+- host configuration and hardening
+- iSCSI target and initiator setup
+- Corosync/Pacemaker formation
+- NFS, SMB, and client-facing iSCSI config
+- monitoring and Cockpit setup
 
-What still remains manual on purpose:
+## What remains manual on purpose
+
+After Ansible completes, use the generated scripts on the active storage node:
 
 - `/root/create-pool.sh`
 - `/root/configure-stonith.sh`
 - `/root/configure-pacemaker-resources.sh`
 
+These remain manual because they are destructive, environment-specific, or depend on verified runtime state.
+
 ## Update flow
 
-Build and publish a new bootc image revision, then update one node at a time.
+For rolling maintenance on deployed bootc nodes:
 
-Suggested order:
+1. publish or retag the next image revision
+2. update `quorum`
+3. update the standby storage node
+4. update the active storage node
 
-1. move cluster resources away from the node you are updating
-2. run `bootc upgrade` on that node
-3. reboot the node
-4. verify cluster health and storage services
-5. repeat for the next node
+Common commands on a node:
 
-For the active/passive storage pair, treat updates exactly like other HA maintenance: keep service ownership on the peer before rebooting a storage node.
+```bash
+sudo bootc upgrade --download-only
+sudo bootc status --verbose
+sudo bootc upgrade --from-downloaded --apply
+```
 
-## Image design notes
+Or fetch and apply immediately:
 
-### Storage image
+```bash
+sudo bootc upgrade --apply
+```
 
-Bakes in:
+If you need to move a host to a different tracked image ref:
 
-- common base tools from the original `common` role
-- hardening packages (`nftables`, `audit`, `rsyslog`, `watchdog`)
-- ZFS from the OpenZFS EL9 repository, built with DKMS for the image kernel
-- backend and client-facing iSCSI packages
-- Pacemaker / Corosync / pcs / fence agents
-- NFS + Samba packages
-- Cockpit packages
-- Prometheus exporters and hardware monitoring tools
+```bash
+sudo bootc switch registry.example.com/ha-san/storage:stable
+```
 
-### Quorum image
+Rollback path:
 
-Bakes in only what the quorum node needs:
+```bash
+sudo bootc rollback
+sudo reboot
+```
 
-- common base tools
-- hardening packages
-- Pacemaker / Corosync / pcs / fence agents
-- monitoring packages
-- no ZFS, no iSCSI target/initiator, no NFS/SMB, no Cockpit plugins
-
-### Automatic updates
-
-The image masks the default `bootc-fetch-apply-updates.timer` so nodes do not auto-apply updates in the middle of cluster operations. Use controlled rolling maintenance instead.
-
-### Root filesystem and read-only `/`
-
-The image sets XFS as the default installed root filesystem and enables composefs for a read-only deployment layout.
-
-### 45Drives Cockpit plugins
-
-The 45Drives repository install is kept as a best-effort optional step in the storage image build because those packages are external to the CentOS Stream base.
+For storage nodes, always move cluster resources away first and verify the returning node is healthy before touching the peer.
