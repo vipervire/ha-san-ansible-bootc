@@ -1,0 +1,12 @@
+# Example config for qcow2/raw image builds.
+# This is NOT used together with a custom installer kickstart.
+
+[[customizations.user]]
+name = "storageadmin"
+password = "replace-with-a-temporary-password-or-remove-this-line"
+key = "ssh-ed25519 AAAA...replace-me"
+groups = ["wheel"]
+
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "20 GiB"

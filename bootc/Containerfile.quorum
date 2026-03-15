@@ -1,0 +1,49 @@
+ARG BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9
+FROM ${BASE_IMAGE}
+
+COPY bootc/files/00-ha-san.toml /usr/lib/bootc/install/00-ha-san.toml
+COPY bootc/files/config.toml /usr/lib/bootc-image-builder/config.toml
+COPY bootc/files/prepare-root.conf /usr/lib/ostree/prepare-root.conf
+COPY bootc/files/wheel-passwordless-sudo /etc/sudoers.d/wheel-passwordless-sudo
+
+RUN chmod 0440 /etc/sudoers.d/wheel-passwordless-sudo && \
+    mkdir -p /etc/systemd/system && \
+    ln -sf /dev/null /etc/systemd/system/bootc-fetch-apply-updates.timer && \
+    dnf -y install dnf-plugins-core && \
+    dnf config-manager --set-enabled crb || true && \
+    dnf -y install epel-release && \
+    dnf -y --enablerepo=highavailability install \
+      ca-certificates \
+      curl \
+      gnupg2 \
+      sudo \
+      vim-enhanced \
+      tmux \
+      htop \
+      iotop \
+      net-tools \
+      bind-utils \
+      rsync \
+      chrony \
+      python3 \
+      python3-pip \
+      openssh-server \
+      openssh-clients \
+      nftables \
+      audit \
+      rsyslog \
+      watchdog \
+      pacemaker \
+      corosync \
+      pcs \
+      fence-agents-all \
+      golang-github-prometheus-node-exporter \
+      prometheus-ha-cluster-exporter \
+      rasdaemon \
+      smartmontools \
+      ethtool && \
+    python3 -m pip install --no-cache-dir python-kasa && \
+    dnf -y remove avahi cups bluez ModemManager firewalld || true && \
+    dnf -y clean all && \
+    rm -rf /var/cache/dnf /var/tmp/* /tmp/* && \
+    systemctl enable sshd chronyd

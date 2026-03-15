@@ -1,0 +1,31 @@
+---
+# =============================================================================
+# Storage Node Variables — NFS and SMB service configuration
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# NFS
+# ---------------------------------------------------------------------------
+nfs_exports:
+  - path: "/{{ zfs_pool_name }}/nfs"
+    clients: "10.30.30.0/24"
+    options: "rw,sync,no_subtree_check,root_squash,sec=sys"
+  - path: "/{{ zfs_pool_name }}/k3s-pv"
+    clients: "10.30.30.0/24"
+    options: "rw,sync,no_subtree_check,root_squash,sec=sys"
+
+# NFS listens on all interfaces; nftables restricts access to client VLANs.
+# Per-export client restrictions are set in the 'clients' field above.
+
+# ---------------------------------------------------------------------------
+# Samba / SMB
+# ---------------------------------------------------------------------------
+smb_workgroup: "HOMELAB"
+smb_server_string: "HA SAN SMB"
+smb_encrypt: "required"   # "desired" if some clients can't do SMB3 encryption
+smb_shares:
+  - name: shared
+    path: "/{{ zfs_pool_name }}/smb"
+    read_only: false
+    valid_users: "@smbusers"
+    shadow_copy: true

@@ -1,0 +1,99 @@
+---
+# =============================================================================
+# storage-b — Node-Specific Variables
+# =============================================================================
+
+storage_ip: "10.10.10.2"
+mgmt_ip: "10.20.20.2"
+
+# Per-VLAN client IPs — keyed by client_vlans[].name
+client_ips:
+  enduser: "10.30.30.2"
+  hypervisor: "10.40.40.2"
+
+ssh_listen_addresses:
+  - "{{ mgmt_ip }}"
+
+iscsi_target_iqn: "{{ iscsi_iqn_prefix }}:storage-b"
+iscsi_initiator_name: "{{ iscsi_iqn_prefix }}:initiator-b"
+
+iscsi_peer_ip: "10.10.10.1"
+iscsi_peer_iqn: "{{ iscsi_iqn_prefix }}:storage-a"
+
+# ---------------------------------------------------------------------------
+# Local disks — MUST use persistent /dev/disk/by-id/ paths
+# ---------------------------------------------------------------------------
+# /dev/sdX paths are NOT stable — they reorder on reboot, drive replacement,
+# or BIOS update and will cause pool creation to target wrong disks.
+#
+# To find by-id paths on this node:
+#   ls -la /dev/disk/by-id/ | grep -v part | grep -v wwn
+#   Use ata-*, scsi-*, or nvme-* identifiers (NOT wwn — those are hardware-specific)
+#
+# Symmetric active/passive HA design:
+# Each node exports its local disks via LIO iSCSI target AND connects to the peer's target.
+# ZFS pool mirrors own local disks (physical) with peer's disks (iSCSI).
+# Either node can be active primary. On failover, the surviving node imports the pool
+# in degraded state (local disks only) and continues serving until the peer is restored.
+# Pool re-silvering restores full redundancy once the peer reconnects.
+
+local_data_disks:
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_0
+    label: "data-b-0"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_1
+    label: "data-b-1"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_2
+    label: "data-b-2"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_3
+    label: "data-b-3"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_4
+    label: "data-b-4"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_5
+    label: "data-b-5"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_6
+    label: "data-b-6"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_7
+    label: "data-b-7"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_8
+    label: "data-b-8"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_9
+    label: "data-b-9"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_10
+    label: "data-b-10"
+  - device: /dev/disk/by-id/ata-PLACEHOLDER_DISK_B_11
+    label: "data-b-11"
+
+# Optional: SLOG and special vdev disks (NVMe recommended for SLOG)
+# SLOG accelerates sync writes (NFS sync, database commits) significantly.
+# Uncomment and replace placeholders if you have dedicated NVMe devices.
+# slog_disk:
+#   device: /dev/disk/by-id/nvme-PLACEHOLDER_NVME_B
+#   label: "slog-b"
+# special_disk:
+#   device: /dev/disk/by-id/nvme-PLACEHOLDER_SPECIAL_B
+#   label: "special-b"
+
+# ---------------------------------------------------------------------------
+# Per-node watchdog overrides (optional)
+# ---------------------------------------------------------------------------
+# These override the global watchdog_* settings from group_vars/all.yml for
+# this node only. Useful when storage-a and storage-b have different hardware
+# (e.g. one has Intel TCO, the other only has softdog).
+#
+# See docs/watchdog.md for full module and option reference.
+#
+# Example — software watchdog (available on all x86 systems):
+# watchdog_enabled: true
+# watchdog_module: softdog
+# watchdog_module_options:
+#   soft_margin: "60"
+#
+# Example — Intel TCO hardware watchdog:
+# watchdog_enabled: true
+# watchdog_module: iTCO_wdt
+# watchdog_timeout: 60
+# watchdog_interval: 10
+#
+# Example — AMD server board:
+# watchdog_enabled: true
+# watchdog_module: sp5100_tco

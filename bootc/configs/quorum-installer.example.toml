@@ -1,0 +1,22 @@
+# Replace every <PLACEHOLDER> before use.
+# Generate the password hash with: openssl passwd -6
+# Ensure <INSTALL_DISK> is the dedicated OS disk and NOT one of the SAN data disks.
+
+[customizations.installer.kickstart]
+contents = """
+text --non-interactive
+lang en_US.UTF-8
+keyboard us
+timezone America/Chicago --utc
+zerombr
+ignoredisk --only-use=<INSTALL_DISK>
+clearpart --all --drives=<INSTALL_DISK> --initlabel
+autopart --type=lvm --fstype=xfs --noswap
+network --bootproto=static --device=<MGMT_INTERFACE> --ip=<MGMT_IP> --netmask=<NETMASK> --gateway=<GATEWAY> --nameserver=<DNS> --activate --onboot=on --hostname=quorum
+firewall --disabled
+rootpw --lock
+user --name=storageadmin --groups=wheel --password=<SHA512_PASSWORD_HASH> --iscrypted
+sshkey --username=storageadmin "ssh-ed25519 AAAA...replace-me"
+services --enabled=sshd,chronyd
+reboot
+"""
